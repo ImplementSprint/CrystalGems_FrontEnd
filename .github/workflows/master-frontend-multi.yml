@@ -1,0 +1,698 @@
+########################################################################
+# MASTER FRONTEND PIPELINE — MULTI-SYSTEM
+# Stack: Next.js (React) — Test on Replit → UAT/Prod on Vercel
+# Flow:  test → uat → pre-production → backup → governance → production
+#
+# DIRECTORY STRUCTURE:
+#   systems/
+#     system-a/          ← e.g. main portal
+#       src/  app/  package.json  next.config.js
+#     system-b/          ← e.g. admin portal
+#       src/  app/  package.json  next.config.js
+#   .github/workflows/
+#     master-frontend-multi.yml   ← this file
+#     notify.yml
+#
+# TO ADD MORE SYSTEMS: duplicate the entire System B block and replace
+# all occurrences of "sysB" / "system-b" / "SYSB" with the new name.
+# NOTE: Repository is PUBLIC. Never commit secrets or .env files.
+########################################################################
+name: 🖥️ Frontend Master Pipeline (Multi-System)
+
+on:
+  push:
+    branches: [test, uat, main]
+  pull_request:
+    branches: [test, uat, main]
+
+env:
+  TRIBE_NAME: ${{ vars.TRIBE_NAME }}
+
+concurrency:
+  group: frontend-multi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+# ════════════════════════════════════════════════════════════════════
+# ██████  PAKIPARK  ██████████████████████████████████████████████████
+# ════════════════════════════════════════════════════════════════════
+
+  # ── PAKIPARK – TEST ───────────────────────────────────────────────
+  sysA-test:
+    name: "[PAKIPARK | TEST] Jest/Vitest Tests"
+    if: github.ref == 'refs/heads/test' || (github.event_name == 'pull_request' && github.base_ref == 'test')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: systems/pakipark
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakipark/package-lock.json }
+      - run: npm ci
+      - run: npm test -- --coverage --passWithNoTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sysA-coverage-${{ github.run_number }}
+          path: systems/pakipark/coverage/
+          retention-days: 30
+
+  sysA-sonar:
+    name: "[PAKIPARK | TEST] SonarCloud"
+    if: github.ref == 'refs/heads/test'
+    runs-on: ubuntu-latest
+    needs: ppark-test
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: systems/pakipark
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY_SYSA }}
+            -Dsonar.organization=${{ vars.SONAR_ORG }}
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+  sysA-quality-gate:
+    name: "[PAKIPARK | TEST] Quality Gate"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-sonar
+    environment: test-quality-gate-ppark
+    steps:
+      - run: echo "✅ PAKIPARK quality gate approved"
+
+  sysA-deploy-test:
+    name: "[PAKIPARK | TEST] Deploy to Replit"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-quality-gate
+    environment:
+      name: test-ppark
+      url: ${{ vars.REPLIT_APP_URL_TEST_SYSA }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    defaults:
+      run:
+        working-directory: systems/pakipark
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakipark/package-lock.json }
+      - run: npm ci
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Deploy to Replit (Test)
+        run: |
+          curl -X POST "${{ secrets.REPLIT_DEPLOY_HOOK_TEST_SYSA }}" \
+            -H "Authorization: Bearer ${{ secrets.REPLIT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"branch":"test","system":"pakipark","env":"test"}'
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-pakipark-frontend-v${{ steps.version.outputs.VERSION }}-test"
+          name: "[pakipark frontend] Test v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  sysA-notify-test:
+    name: "[PAKIPARK | TEST] Notify"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [ppark-deploy-test]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.ppark-deploy-test.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/pakipark Frontend – Test"
+      version: ${{ needs.ppark-deploy-test.outputs.version }}
+      environment: test
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: pakipark
+    secrets: inherit
+
+  # ── PAKIPARK – UAT ────────────────────────────────────────────────
+  ppark-build-uat:
+    name: "[PAKIPARK | UAT] Build (Next.js)"
+    if: github.ref == 'refs/heads/uat' || (github.event_name == 'pull_request' && github.base_ref == 'uat')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: systems/pakipark
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakipark/package-lock.json }
+      - run: npm ci && npm run build
+        env: { NEXT_PUBLIC_APP_ENV: uat }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppark-uat-build-${{ github.run_number }}
+          path: systems/pakipark/.next/
+          retention-days: 14
+
+  ppark-deploy-uat:
+    name: "[PAKIPARK | UAT] Deploy to Vercel"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-build-uat
+    environment:
+      name: uat-ppark
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakipark
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - id: deploy
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_PPARK_UAT }}
+          vercel-args: '--prod'
+
+  ppark-e2e-uat:
+    name: "[PAKIPARK | UAT] Selenium + k6"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-deploy-uat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+        working-directory: systems/pakipark
+      - run: npm run test:e2e
+        working-directory: systems/pakipark
+        env:
+          APP_URL: ${{ needs.ppark-deploy-uat.outputs.url }}
+      - name: k6 load test
+        run: |
+          sudo apt-get update && sudo apt-get install -y k6
+          k6 run systems/pakipark/tests/load/load.js
+        env:
+          K6_BASE_URL: ${{ needs.ppark-deploy-uat.outputs.url }}
+
+  ppark-qa-gate-uat:
+    name: "[PAKIPARK | UAT] QA Approval"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-e2e-uat
+    environment: uat-qa-gate-ppark
+    steps:
+      - run: echo "✅ PAKIPARK UAT approved"
+
+  ppark-release-uat:
+    name: "[PAKIPARK | UAT] GitHub Pre-Release"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-qa-gate-uat
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakipark
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-pakipark-frontend-v${{ steps.version.outputs.VERSION }}-uat"
+          name: "[pakipark frontend] UAT v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  ppark-notify-uat:
+    name: "[PAKIPARK | UAT] Notify"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [ppark-release-uat, ppark-deploy-uat]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.ppark-release-uat.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/pakipark Frontend – UAT"
+      version: ${{ needs.ppark-deploy-uat.outputs.version }}
+      environment: uat
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: pakipark
+    secrets: inherit
+
+  # ── PAKIPARK – PRODUCTION ─────────────────────────────────────────
+  ppark-build-prod:
+    name: "[PAKIPARK | PROD] Build (Next.js)"
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: systems/pakipark
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakipark/package-lock.json }
+      - run: npm ci && npm run build
+        env: { NEXT_PUBLIC_APP_ENV: production }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppark-prod-build-${{ github.run_number }}
+          path: systems/pakipark/.next/
+          retention-days: 90
+
+  ppark-deploy-preprod:
+    name: "[PAKIPARK | PROD] Deploy to Pre-Production (Vercel)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-build-prod
+    environment:
+      name: pre-production-ppark
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakipark
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - id: deploy
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_SYSA_PROD }}
+          vercel-args: '--prod'
+
+  ppark-backup-preprod:
+    name: "[PAKIPARK | PROD] Backup Deployment Manifest"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-deploy-preprod
+    steps:
+      - name: Commit manifest to backup repository
+        run: |
+          git config --global user.name  "CI/CD Bot"
+          git config --global user.email "cicd-bot@org.local"
+          git clone https://x-access-token:${{ secrets.BACKUP_REPO_PAT }}@github.com/${{ vars.BACKUP_REPO }} /tmp/backup-repo
+          mkdir -p /tmp/backup-repo/${{ env.TRIBE_NAME }}/pakipark/frontend
+          cat > /tmp/backup-repo/${{ env.TRIBE_NAME }}/pakipark/frontend/pre-prod-${{ needs.ppark-deploy-preprod.outputs.version }}.json << EOF
+          {
+            "tribe": "${{ env.TRIBE_NAME }}", "system": "pakipark", "repo_type": "frontend",
+            "version": "${{ needs.ppark-deploy-preprod.outputs.version }}",
+            "environment": "pre-production",
+            "vercel_url": "${{ needs.ppark-deploy-preprod.outputs.url }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "deployed_by": "${{ github.actor }}"
+          }
+          EOF
+          cd /tmp/backup-repo && git add . && git commit -m "backup: ${{ env.TRIBE_NAME }}/pakipark frontend pre-prod v${{ needs.ppark-deploy-preprod.outputs.version }}" && git push
+
+  ppark-governance:
+    name: "[PAKIPARK | PROD] Governance"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-backup-preprod
+    environment: governance
+    steps:
+      - run: echo "✅ Pakipark governance approved"
+
+  ppark-deploy-prod:
+    name: "[PAKIPARK | PROD] Deploy to Production (Vercel)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: ppark-governance
+    environment:
+      name: production-ppark
+      url: https://${{ vars.PROD_DOMAIN_ppark }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakipark
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_SYSA_PROD }}
+          vercel-args: '--prod'
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-pakipark-frontend-v${{ steps.version.outputs.VERSION }}"
+          name: "[pakipark frontend] Release v${{ steps.version.outputs.VERSION }}"
+          makeLatest: false
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  ppark-notify-prod:
+    name: "[PAKIPARK | PROD] Notify"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [ppark-deploy-prod]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.ppark-deploy-prod.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/pakipark Frontend – Production"
+      version: ${{ needs.ppark-deploy-prod.outputs.version }}
+      environment: production
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: pakipark
+    secrets: inherit
+
+# ════════════════════════════════════════════════════════════════════
+# ██████  PAKISHIP  ██████████████████████████████████████████████████
+# To add more systems: duplicate this entire block and replace:
+#   "sysB" → new prefix   "system-b" → new name   "SYSB" → new var suffix
+# ════════════════════════════════════════════════════════════════════
+
+  # ── PAKISHIP – TEST ───────────────────────────────────────────────
+  pship-test:
+    name: "[PAKISHIP | TEST] Jest/Vitest Tests"
+    if: github.ref == 'refs/heads/test' || (github.event_name == 'pull_request' && github.base_ref == 'test')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: systems/pakiship
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakiship/package-lock.json }
+      - run: npm ci
+      - run: npm test -- --coverage --passWithNoTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pship-coverage-${{ github.run_number }}
+          path: systems/pakiship/coverage/
+          retention-days: 30
+
+  pship-sonar:
+    name: "[PAKISHIP | TEST] SonarCloud"
+    if: github.ref == 'refs/heads/test'
+    runs-on: ubuntu-latest
+    needs: pship-test
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: systems/pakiship
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY_PSHIP }}
+            -Dsonar.organization=${{ vars.SONAR_ORG }}
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+  pship-quality-gate:
+    name: "[PAKISHIP | TEST] Quality Gate"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-sonar
+    environment: test-quality-gate-pship
+    steps:
+      - run: echo "✅ PAKISHIP quality gate approved"
+
+  pship-deploy-test:
+    name: "[PAKISHIP | TEST] Deploy to Replit"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-quality-gate
+    environment:
+      name: test-pship
+      url: ${{ vars.REPLIT_APP_URL_TEST_PSHIP }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    defaults:
+      run:
+        working-directory: systems/pakiship
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakiship/package-lock.json }
+      - run: npm ci
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Deploy to Replit (Test)
+        run: |
+          curl -X POST "${{ secrets.REPLIT_DEPLOY_HOOK_TEST_PSHIP }}" \
+            -H "Authorization: Bearer ${{ secrets.REPLIT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"branch":"test","system":"pakiship","env":"test"}'
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-pakiship-frontend-v${{ steps.version.outputs.VERSION }}-test"
+          name: "[pakiship frontend] Test v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  pship-notify-test:
+    name: "[PAKISHIP | TEST] Notify"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [pship-deploy-test]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.pship-deploy-test.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/pakiship Frontend – Test"
+      version: ${{ needs.pship-deploy-test.outputs.version }}
+      environment: test
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: pakiship
+    secrets: inherit
+
+  # ── PAKISHIP – UAT ────────────────────────────────────────────────
+  pship-build-uat:
+    name: "[PAKISHIP | UAT] Build (Next.js)"
+    if: github.ref == 'refs/heads/uat' || (github.event_name == 'pull_request' && github.base_ref == 'uat')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: systems/pakiship
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakiship/package-lock.json }
+      - run: npm ci && npm run build
+        env: { NEXT_PUBLIC_APP_ENV: uat }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pship-uat-build-${{ github.run_number }}
+          path: systems/pakiship/.next/
+          retention-days: 14
+
+  pship-deploy-uat:
+    name: "[PAKISHIP | UAT] Deploy to Vercel"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-build-uat
+    environment:
+      name: uat-pship
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakiship
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - id: deploy
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_PSHIP_UAT }}
+          vercel-args: '--prod'
+
+  pship-e2e-uat:
+    name: "[PAKISHIP | UAT] Selenium + k6"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-deploy-uat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+        working-directory: systems/pakiship
+      - run: npm run test:e2e
+        working-directory: systems/pakiship
+        env:
+          APP_URL: ${{ needs.pship-deploy-uat.outputs.url }}
+      - name: k6 load test
+        run: |
+          sudo apt-get update && sudo apt-get install -y k6
+          k6 run systems/pakiship/tests/load/load.js
+        env:
+          K6_BASE_URL: ${{ needs.pship-deploy-uat.outputs.url }}
+
+  pship-qa-gate-uat:
+    name: "[PAKISHIP | UAT] QA Approval"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-e2e-uat
+    environment: uat-qa-gate-pship
+    steps:
+      - run: echo "✅ PAKISHIP UAT approved"
+
+  pship-release-uat:
+    name: "[PAKISHIP | UAT] GitHub Pre-Release"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-qa-gate-uat
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakiship
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-pakiship-frontend-v${{ steps.version.outputs.VERSION }}-uat"
+          name: "[pakiship frontend] UAT v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  pship-notify-uat:
+    name: "[PAKISHIP | UAT] Notify"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [pship-release-uat, pship-deploy-uat]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.pship-release-uat.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/pakiship Frontend – UAT"
+      version: ${{ needs.pship-deploy-uat.outputs.version }}
+      environment: uat
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: pakiship
+    secrets: inherit
+
+  # ── PAKISHIP – PRODUCTION ─────────────────────────────────────────
+  pship-build-prod:
+    name: "[PAKISHIP | PROD] Build (Next.js)"
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: systems/pakiship
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: systems/pakiship/package-lock.json }
+      - run: npm ci && npm run build
+        env: { NEXT_PUBLIC_APP_ENV: production }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pship-prod-build-${{ github.run_number }}
+          path: systems/pakiship/.next/
+          retention-days: 90
+
+  pship-deploy-preprod:
+    name: "[PAKISHIP | PROD] Deploy to Pre-Production (Vercel)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-build-prod
+    environment:
+      name: pre-production-pakiship
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakiship
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - id: deploy
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_PSHIP_PROD }}
+          vercel-args: '--prod'
+
+  pship-backup-preprod:
+    name: "[PAKISHIP | PROD] Backup Deployment Manifest"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-deploy-preprod
+    steps:
+      - name: Commit manifest to backup repository
+        run: |
+          git config --global user.name  "CI/CD Bot"
+          git config --global user.email "cicd-bot@org.local"
+          git clone https://x-access-token:${{ secrets.BACKUP_REPO_PAT }}@github.com/${{ vars.BACKUP_REPO }} /tmp/backup-repo
+          mkdir -p /tmp/backup-repo/${{ env.TRIBE_NAME }}/pakiship/frontend
+          cat > /tmp/backup-repo/${{ env.TRIBE_NAME }}/pakiship/frontend/pre-prod-${{ needs.pship-deploy-preprod.outputs.version }}.json << EOF
+          {
+            "tribe": "${{ env.TRIBE_NAME }}", "system": "pakiship", "repo_type": "frontend",
+            "version": "${{ needs.pship-deploy-preprod.outputs.version }}",
+            "environment": "pre-production",
+            "vercel_url": "${{ needs.pship-deploy-preprod.outputs.url }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "deployed_by": "${{ github.actor }}"
+          }
+          EOF
+          cd /tmp/backup-repo && git add . && git commit -m "backup: ${{ env.TRIBE_NAME }}/pakiship frontend pre-prod v${{ needs.pship-deploy-preprod.outputs.version }}" && git push
+
+  pship-governance:
+    name: "[PAKISHIP | PROD] Governance"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-backup-preprod
+    environment: governance
+    steps:
+      - run: echo "✅ PAKISHIP governance approved"
+
+  pship-deploy-prod:
+    name: "[PAKISHIP | PROD] Deploy to Production (Vercel)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: pship-governance
+    environment:
+      name: production-pakiship
+      url: https://${{ vars.PROD_DOMAIN_PSHIP }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        working-directory: systems/pakiship
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_PSHIP_PROD }}
+          vercel-args: '--prod'
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-pakiship-frontend-v${{ steps.version.outputs.VERSION }}"
+          name: "[pakiship frontend] Release v${{ steps.version.outputs.VERSION }}"
+          makeLatest: false
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  pship-notify-prod:
+    name: "[PAKISHIP | PROD] Notify"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [pship-deploy-prod]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.pship-deploy-prod.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/pakiship Frontend – Production"
+      version: ${{ needs.pship-deploy-prod.outputs.version }}
+      environment: production
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: pakiship
+    secrets: inherit
